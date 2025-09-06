@@ -32,4 +32,4 @@ This project is a medical appointment management agent designed to streamline sc
 - Run the agent using the provided scripts or by executing `src/main.py`.
 
 ## License
-This project is for educational purposes.
+    Copyright [2025] [Deivyansh Singh]
