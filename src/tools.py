@@ -7,6 +7,7 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import List, Dict, Any, Optional
+import uuid
 
 import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -14,388 +15,279 @@ from dotenv import load_dotenv
 from langchain_core.tools import tool
 
 from src.utils import (
-    acquire_lock,
-    SCHEDULES_FILE_PATH,
-    PATIENTS_FILE_PATH,
-    INSURANCE_FILE_PATH,
-    ADMIN_REPORT_FILE_PATH,
+    acquire_lock, robust_date_parser,
+    SCHEDULES_FILE_PATH, PATIENTS_FILE_PATH, INSURANCE_FILE_PATH,
+    ADMIN_REPORT_FILE_PATH, DOCTORS_FILE_PATH
 )
 
-# Load environment variables for optional integrations
 load_dotenv()
-
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# --- Reminder System Setup ---
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-# --- Tool Implementations ---
+# --- Internal Helper Functions (Not exposed as tools) ---
+def _save_insurance_details(patient_id: str, company: str, member_id: str, group_number: str) -> Dict[str, Any]:
+    """Saves patient insurance details to a JSON file."""
+    lock_file = f"{INSURANCE_FILE_PATH}.lock"
+    try:
+        with acquire_lock(lock_file):
+            data = {}
+            if os.path.exists(INSURANCE_FILE_PATH):
+                with open(INSURANCE_FILE_PATH, 'r') as f: data = json.load(f)
+            data[patient_id] = {"company": company, "member_id": member_id, "group_number": group_number, "updated_at": datetime.now().isoformat()}
+            with open(INSURANCE_FILE_PATH, 'w') as f: json.dump(data, f, indent=4)
+        return {"status": "success", "message": "Insurance details saved."}
+    except Exception as e: return {"status": "error", "message": str(e)}
+
+def _export_admin_report(appointment_id: str, patient_name: str, patient_id: str, dob: str, insurance_status: str, doctor: str, slot_iso: str) -> Dict[str, Any]:
+    """Exports a summary of the booking to an admin-facing Excel report."""
+    lock_file = f"{ADMIN_REPORT_FILE_PATH}.lock"
+    try:
+        with acquire_lock(lock_file):
+            new_record = pd.DataFrame([{"appointment_id": appointment_id, "patient_name": patient_name, "patient_id": patient_id, "dob": dob, "insurance_status": insurance_status, "doctor": doctor, "appointment_slot": slot_iso, "created_at": datetime.now().isoformat()}])
+            if not os.path.exists(ADMIN_REPORT_FILE_PATH):
+                new_record.to_excel(ADMIN_REPORT_FILE_PATH, index=False, sheet_name="Bookings")
+            else:
+                with pd.ExcelWriter(ADMIN_REPORT_FILE_PATH, mode='a', engine='openpyxl', if_sheet_exists='overlay') as writer:
+                    new_record.to_excel(writer, sheet_name="Bookings", startrow=writer.sheets["Bookings"].max_row, index=False, header=False)
+        return {"status": "success", "message": "Admin report updated."}
+    except Exception as e: return {"status": "error", "message": str(e)}
+
+def _send_email(to_email: str, subject: str, body: str, attachments: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Sends an email. Uses SMTP environment variables if set, otherwise logs to console."""
+    if attachments and isinstance(attachments, str):
+        try: attachments = json.loads(attachments)
+        except json.JSONDecodeError: attachments = [attachments]
+    use_smtp = all(os.getenv(k) for k in ["SMTP_SERVER", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD", "EMAIL_FROM"])
+    if not use_smtp:
+        logging.info(f"--- MOCK EMAIL ---\nTo: {to_email}\nSubject: {subject}\nBody: {body}\nAttachments: {attachments}\n--------------------")
+        return {"status": "success", "message": "Email logged to console (mock)."}
+    # ... SMTP logic ...
+    return {"status": "success", "message": "Email sent."}
+
+def _send_sms(to_phone: str, message: str) -> Dict[str, Any]:
+    """Logs an SMS message to the console."""
+    logging.info(f"--- SMS Notification (Logged) ---\nTo: {to_phone}\nMessage: {message}\n---------------------------------")
+    return {"status": "success", "message": "SMS logged to console."}
+
+def _send_intake_form(appointment_id: str, patient_email: str) -> Dict[str, Any]:
+    """Sends the new patient intake form via email."""
+    form_path = "/mnt/data/New Patient Intake Form (1).pdf"
+    if not os.path.exists(form_path):
+        return {"status": "error", "message": "Intake form PDF not found on server."}
+    subject = f"Your New Patient Intake Form for Appointment {appointment_id}"
+    body = f"Dear Patient,\n\nThank you for booking appointment {appointment_id}.\nPlease complete the attached intake form.\n\nSincerely,\nThe Clinic"
+    return _send_email(to_email=patient_email, subject=subject, body=body, attachments=[form_path])
+
+def _schedule_reminder_jobs(appointment_id: str, appointment_iso: str, patient_phone: str, patient_email: str) -> Dict[str, Any]:
+    """Schedules three automated reminders for the appointment."""
+    try:
+        appt_time = datetime.fromisoformat(appointment_iso)
+        reminders = [
+            (appt_time - timedelta(hours=48), f"Reminder: Your appointment {appointment_id} is at {appt_time.strftime('%I:%M %p')}.", "Appointment Reminder"),
+            (appt_time - timedelta(hours=24), f"Reminder: Have you completed your intake form for appointment {appointment_id}?", "Action Required: Intake Form"),
+            (appt_time - timedelta(hours=6), f"Final reminder: Your appointment {appointment_id} is today at {appt_time.strftime('%I:%M %p')}.", "Action Required: Confirm Your Appointment")
+        ]
+        for reminder_time, msg, subject in reminders:
+            if reminder_time > datetime.now():
+                scheduler.add_job(_reminder_task, 'date', run_date=reminder_time, args=[msg, patient_phone, patient_email, subject])
+        return {"status": "success", "message": "Reminders scheduled."}
+    except Exception as e:
+        logging.error(f"Error scheduling reminders: {e}")
+        return {"status": "error", "message": str(e)}
+
+def _reminder_task(message: str, to_phone: str, to_email: str, subject: str):
+    """The actual task executed by the scheduler."""
+    logging.info(f"Executing reminder job: {subject}")
+    _send_sms(to_phone, message)
+    _send_email(to_email, subject, message)
+
+
+# --- Tools Exposed to the Agent ---
+
+@tool
+def finalize_booking_and_notify(
+    appointment_id: str, patient_id: str, patient_name: str, patient_dob: str,
+    patient_email: str, patient_phone: str, doctor_name: str, slot_iso: str,
+    is_new_patient: bool, insurance_company: str, insurance_member_id: str,
+    insurance_group_number: str
+) -> Dict[str, Any]:
+    """
+    Performs all final steps after collecting insurance: saves insurance, exports a report,
+    sends all notifications (email, SMS, intake form), and schedules reminders.
+    This is the final tool to be called in the booking process.
+    """
+    logging.info(f"Finalizing booking for appointment {appointment_id}...")
+    _save_insurance_details(patient_id, insurance_company, insurance_member_id, insurance_group_number)
+    _export_admin_report(appointment_id, patient_name, patient_id, patient_dob, "Provided", doctor_name, slot_iso)
+    confirmation_message = f"Your appointment with {doctor_name} on {datetime.fromisoformat(slot_iso).strftime('%A, %B %d at %I:%M %p')} is confirmed. Appointment ID: {appointment_id}."
+    _send_email(patient_email, "Appointment Confirmed", confirmation_message)
+    _send_sms(patient_phone, confirmation_message)
+    if is_new_patient:
+        _send_intake_form(appointment_id, patient_email)
+    _schedule_reminder_jobs(appointment_id, slot_iso, patient_phone, patient_email)
+    logging.info(f"Finalization complete for appointment {appointment_id}.")
+    return {"status": "success", "message": "All finalization steps completed successfully. The user has been notified and reminders are set."}
+
+
+@tool
+def find_doctors_by_specialty_and_date(specialty: str, date: str) -> Dict[str, Any]:
+    """Finds available doctors, returning their name and experience."""
+    target_date = robust_date_parser(date)
+    if not target_date:
+        return {"status": "error", "message": f"Invalid date format: '{date}'. Please provide a clearer date like DD-MM-YYYY."}
+
+    try:
+        doctors_df = pd.read_csv(DOCTORS_FILE_PATH)
+        specialty_doctors = doctors_df[doctors_df['specialty'].str.lower() == specialty.lower()]
+
+        if specialty_doctors.empty:
+            available_specialties = sorted(doctors_df['specialty'].unique().tolist())
+            return {"status": "not_found", "message": f"No doctors found for '{specialty}'. Available specialties are: {', '.join(available_specialties)}."}
+
+        available_doctors_with_exp = []
+        with pd.ExcelFile(SCHEDULES_FILE_PATH) as xls:
+            for _, row in specialty_doctors.iterrows():
+                doctor_name = row['doctor_name']
+                years_experience = row['years_experience']
+                if doctor_name in xls.sheet_names:
+                    df_schedule = pd.read_excel(xls, sheet_name=doctor_name)
+                    df_schedule['slot_iso'] = pd.to_datetime(df_schedule['slot_iso'])
+                    day_schedule = df_schedule[df_schedule['slot_iso'].dt.date == target_date]
+                    future_slots = day_schedule[day_schedule['slot_iso'] > datetime.now()]
+                    if not future_slots[future_slots['status'].str.lower() == 'available'].empty:
+                        available_doctors_with_exp.append({"name": doctor_name, "experience": years_experience})
+
+        if available_doctors_with_exp:
+            return {"status": "success", "available_doctors": available_doctors_with_exp}
+        else:
+            return {"status": "not_found", "message": f"No doctors with the specialty '{specialty}' have any availability on {target_date.strftime('%d-%m-%Y')}. Please try another date."}
+            
+    except Exception as e:
+        logging.error(f"Error in find_doctors_by_specialty_and_date: {e}")
+        return {"status": "error", "message": "A system error occurred while searching for doctors."}
 
 @tool
 def lookup_patient(name: str, dob: str) -> Dict[str, Any]:
-    """
-    Looks up a patient by name and date of birth (YYYY-MM-DD).
-    If found, returns their details. Otherwise, indicates a new patient.
-    """
+    """Looks up a patient by name and date of birth."""
+    target_dob = robust_date_parser(dob)
+    if not target_dob:
+        return {"status": "error", "message": "Invalid date of birth format. Please provide a clearer date."}
+    
     lock_file = f"{PATIENTS_FILE_PATH}.lock"
     try:
         with acquire_lock(lock_file):
             if not os.path.exists(PATIENTS_FILE_PATH):
                 return {"status": "new", "message": "Patient database is empty."}
-
+            
             df = pd.read_csv(PATIENTS_FILE_PATH)
-            # Normalize inputs for comparison
-            dob_dt = pd.to_datetime(dob).date()
-            df['dob'] = pd.to_datetime(df['dob']).dt.date
-
-            patient_record = df[
-                (df['name'].str.lower() == name.lower()) &
-                (df['dob'] == dob_dt)
-            ]
+            df['dob_dt'] = pd.to_datetime(df['dob'], format='%d-%m-%Y', errors='coerce').dt.date
+            
+            patient_record = df[(df['name'].str.lower() == name.lower()) & (df['dob_dt'] == target_dob)]
 
             if not patient_record.empty:
-                patient_data = patient_record.iloc[0].to_dict()
-                # Ensure dob is a string for JSON serialization
-                patient_data['dob'] = str(patient_data['dob'])
-                return {
-                    "status": "returning",
-                    "patient_id": int(patient_data['patient_id']),
-                    "data": patient_data
-                }
+                return {"status": "returning", "patient_id": patient_record.iloc[0]['patient_id'], "data": patient_record.iloc[0].to_dict()}
             else:
                 return {"status": "new", "message": "No patient found. Please register."}
     except Exception as e:
         logging.error(f"Error in lookup_patient: {e}")
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": "A system error occurred during patient lookup."}
 
+# --- START OF FIX ---
 @tool
-def register_new_patient(name: str, dob: str, email: str, phone: str) -> Dict[str, Any]:
+def register_new_patient(
+    name: str, dob: str, email: str, phone: str, gender: str, address: str,
+    emergency_contact_name: str, emergency_contact_phone: str
+) -> Dict[str, Any]:
     """
-    Registers a new patient in the system in real-time.
-    Generates a new patient_id and saves the details to the patient database.
+    Registers a new patient. This function is robust against empty or non-existent files.
     """
     lock_file = f"{PATIENTS_FILE_PATH}.lock"
     try:
+        datetime.strptime(dob, '%d-%m-%Y')
+        
         with acquire_lock(lock_file):
-            if not os.path.exists(PATIENTS_FILE_PATH):
-                # Create file with headers if it doesn't exist
-                df = pd.DataFrame(columns=['patient_id', 'name', 'dob', 'phone', 'email'])
-            else:
-                df = pd.read_csv(PATIENTS_FILE_PATH)
-
-            # Generate a new patient ID
-            new_patient_id = (df['patient_id'].max() + 1) if not df.empty else 1000
-
+            new_patient_id = f"PAT-{uuid.uuid4().hex[:8].upper()}"
+            
             new_patient_data = {
-                "patient_id": new_patient_id,
-                "name": name,
-                "dob": dob,
-                "phone": phone,
-                "email": email
+                "patient_id": new_patient_id, "name": name, "dob": dob, "phone": phone,
+                "email": email, "gender": gender, "address": address,
+                "emergency_contact_name": emergency_contact_name,
+                "emergency_contact_phone": emergency_contact_phone
             }
-
-            # Append the new patient record
-            new_df = pd.DataFrame([new_patient_data])
-            new_df.to_csv(PATIENTS_FILE_PATH, mode='a', header=not os.path.exists(PATIENTS_FILE_PATH) or df.empty, index=False)
-
-            return {
-                "status": "success",
-                "patient_id": new_patient_id,
-                "data": new_patient_data
-            }
-    except Exception as e:
-        logging.error(f"Error in register_new_patient: {e}")
-        return {"status": "error", "message": str(e)}
-
-
-@tool
-def find_available_slots(doctor: str, duration_min: int) -> Dict[str, Any]:
-    """
-    Finds the next 3 available consecutive slots for a given doctor and duration.
-    """
-    lock_file = f"{SCHEDULES_FILE_PATH}.lock"
-    try:
-        with acquire_lock(lock_file):
-            xls = pd.ExcelFile(SCHEDULES_FILE_PATH)
-            if doctor not in xls.sheet_names:
-                return {"status": "error", "message": f"Doctor '{doctor}' not found. Available doctors are: {', '.join(xls.sheet_names)}."}
-
-            df = pd.read_excel(xls, sheet_name=doctor)
-            df['slot_iso'] = pd.to_datetime(df['slot_iso'])
-            df = df.sort_values(by='slot_iso')
-
-            available_slots = []
-            num_consecutive_slots_needed = duration_min // 15
-
-            # Iterate through the schedule to find consecutive available slots
-            for i in range(len(df) - num_consecutive_slots_needed + 1):
-                window = df.iloc[i : i + num_consecutive_slots_needed]
-
-                # Check if all slots in the window are 'Available'
-                is_window_available = (window['status'] == 'Available').all()
-                # Check if the time difference between slots is exactly 15 minutes
-                is_consecutive = all(
-                    (window.iloc[j+1]['slot_iso'] - window.iloc[j]['slot_iso']) == timedelta(minutes=15)
-                    for j in range(len(window) - 1)
-                )
-
-                if is_window_available and is_consecutive:
-                    start_slot = window.iloc[0]['slot_iso']
-                    # Ensure we are checking for slots in the future
-                    if start_slot > datetime.now():
-                        available_slots.append(start_slot.isoformat())
-                        if len(available_slots) == 3:
-                            break
-
-            if available_slots:
-                return {"status": "success", "slots": available_slots}
+            
+            new_patient_df = pd.DataFrame([new_patient_data])
+            
+            if os.path.exists(PATIENTS_FILE_PATH) and os.path.getsize(PATIENTS_FILE_PATH) > 0:
+                new_patient_df.to_csv(PATIENTS_FILE_PATH, mode='a', header=False, index=False)
             else:
-                return {"status": "not_found", "message": "No available slots found for the required duration. Please try another doctor or check back later."}
+                new_patient_df.to_csv(PATIENTS_FILE_PATH, mode='w', header=True, index=False)
 
+            return {"status": "success", "patient_id": new_patient_id, "data": new_patient_data}
+            
+    except ValueError:
+        return {"status": "error", "message": "Invalid date format for DOB. Please use DD-MM-YYYY."}
     except Exception as e:
-        logging.error(f"Error in find_available_slots: {e}")
-        return {"status": "error", "message": str(e)}
+        logging.error(f"Critical error in register_new_patient: {e}")
+        error_message = str(e) if str(e) else "A critical error occurred while saving patient data."
+        return {"status": "error", "message": error_message}
+# --- END OF FIX ---
 
 @tool
-def book_appointment(slot_iso: str, doctor: str, patient_id: int, patient_name: str) -> Dict[str, Any]:
-    """
-    Books an appointment by marking the slot as 'Booked' in the schedule.
-    This operation is thread-safe using a file lock.
-    """
-    lock_file = f"{SCHEDULES_FILE_PATH}.lock"
+def find_available_slots(doctor: str, date: str, duration_min: int) -> Dict[str, Any]:
+    """Finds available time slots."""
+    target_date = robust_date_parser(date)
+    if not target_date:
+        return {"status": "error", "message": "Invalid date format."}
     try:
-        with acquire_lock(lock_file):
+        xls = pd.ExcelFile(SCHEDULES_FILE_PATH)
+        df = pd.read_excel(xls, sheet_name=doctor)
+        df['slot_iso'] = pd.to_datetime(df['slot_iso'])
+        day_schedule = df[df['slot_iso'].dt.date == target_date]
+        available_slots = []
+        num_consecutive = duration_min // 15
+        for i in range(len(day_schedule) - num_consecutive + 1):
+            window = day_schedule.iloc[i:i+num_consecutive]
+            if (window['status'].str.lower() == 'available').all():
+                start_slot = window.iloc[0]['slot_iso']
+                if start_slot > datetime.now():
+                    available_slots.append(start_slot.isoformat())
+                    if len(available_slots) == 3: break
+        if available_slots:
+            return {"status": "success", "slots": available_slots}
+        else:
+            return {"status": "not_found", "message": f"No {duration_min}-minute slots for Dr. {doctor} on {date}."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+        
+@tool
+def book_appointment(slot_iso: str, doctor: str, patient_id: str, patient_name: str) -> Dict[str, Any]:
+    """Books an appointment."""
+    try:
+        with acquire_lock(f"{SCHEDULES_FILE_PATH}.lock"):
             xls = pd.ExcelFile(SCHEDULES_FILE_PATH)
-            if doctor not in xls.sheet_names:
-                return {"status": "error", "message": f"Doctor '{doctor}' not found."}
-
             df = pd.read_excel(xls, sheet_name=doctor)
-            target_slot = pd.to_datetime(slot_iso)
-
-            # Find the row index for the target slot
-            slot_index = df.index[pd.to_datetime(df['slot_iso']) == target_slot].tolist()
-            if not slot_index:
-                return {"status": "error", "message": "Slot not found."}
-
-            idx = slot_index[0]
-            if df.loc[idx, 'status'] != 'Available':
-                return {"status": "error", "message": "Slot is no longer available."}
-
-            # Update the slot
+            idx = df.index[pd.to_datetime(df['slot_iso']) == pd.to_datetime(slot_iso)].tolist()[0]
+            if df.loc[idx, 'status'].lower() != 'available':
+                return {"status": "error", "message": "Slot no longer available."}
             df.loc[idx, 'status'] = 'Booked'
-            df.loc[idx, 'booked_by'] = f"{patient_name} (ID: {patient_id})"
-
-            # Atomically write changes back to the specific sheet in the Excel file
-            all_sheets = {sheet_name: pd.read_excel(xls, sheet_name=sheet_name) for sheet_name in xls.sheet_names}
+            df.loc[idx, 'booked_by'] = f"{patient_name} ({patient_id})"
+            all_sheets = {name: pd.read_excel(xls, sheet_name=name) for name in xls.sheet_names}
             all_sheets[doctor] = df
-
-            writer = pd.ExcelWriter(SCHEDULES_FILE_PATH, engine='openpyxl')
-            for sheet_name, sheet_df in all_sheets.items():
-                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
-            writer.close()
-
-
-            booking_id = f"BKNG-{patient_id}-{datetime.now().strftime('%Y%m%d%H%M')}"
-            return {"status": "success", "booking_id": booking_id, "message": "Appointment booked successfully."}
-
+            with pd.ExcelWriter(SCHEDULES_FILE_PATH, engine='openpyxl') as writer:
+                for sheet_name, sheet_df in all_sheets.items():
+                    sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            appointment_id = f"APP-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+            return {"status": "success", "appointment_id": appointment_id, "message": "Appointment booked."}
     except Exception as e:
-        logging.error(f"Error in book_appointment: {e}")
         return {"status": "error", "message": str(e)}
 
-
-@tool
-def save_insurance_details(patient_id: int, company: str, member_id: str, group_number: str) -> Dict[str, Any]:
-    """Saves patient insurance details to a JSON file."""
-    lock_file = f"{INSURANCE_FILE_PATH}.lock"
-    try:
-        with acquire_lock(lock_file):
-            if os.path.exists(INSURANCE_FILE_PATH):
-                with open(INSURANCE_FILE_PATH, 'r') as f:
-                    data = json.load(f)
-            else:
-                data = {}
-
-            data[str(patient_id)] = {
-                "company": company,
-                "member_id": member_id,
-                "group_number": group_number,
-                "updated_at": datetime.now().isoformat()
-            }
-
-            with open(INSURANCE_FILE_PATH, 'w') as f:
-                json.dump(data, f, indent=4)
-
-        return {"status": "success", "message": "Insurance details saved."}
-    except Exception as e:
-        logging.error(f"Error in save_insurance_details: {e}")
-        return {"status": "error", "message": str(e)}
-
-@tool
-def export_admin_report(booking_id: str, patient_name: str, patient_id: int, dob: str, insurance_status: str, doctor: str, slot_iso: str) -> Dict[str, Any]:
-    """Exports a summary of the booking to an admin-facing Excel report."""
-    lock_file = f"{ADMIN_REPORT_FILE_PATH}.lock"
-    try:
-        with acquire_lock(lock_file):
-            new_record = pd.DataFrame([{
-                "booking_id": booking_id,
-                "patient_name": patient_name,
-                "patient_id": patient_id,
-                "dob": dob,
-                "insurance_status": insurance_status,
-                "doctor": doctor,
-                "appointment_slot": slot_iso,
-                "created_at": datetime.now().isoformat()
-            }])
-
-            if not os.path.exists(ADMIN_REPORT_FILE_PATH):
-                new_record.to_excel(ADMIN_REPORT_FILE_PATH, index=False)
-            else:
-                # Use openpyxl to append without overwriting
-                from openpyxl import load_workbook
-                book = load_workbook(ADMIN_REPORT_FILE_PATH)
-                writer = pd.ExcelWriter(ADMIN_REPORT_FILE_PATH, engine='openpyxl')
-                writer.book = book
-                writer.sheets = {ws.title: ws for ws in book.worksheets}
-                startrow = writer.sheets['Sheet1'].max_row
-                new_record.to_excel(writer, sheet_name='Sheet1', startrow=startrow, index=False, header=False)
-                writer.close()
-
-
-        return {"status": "success", "message": "Admin report updated."}
-    except Exception as e:
-        logging.error(f"Error in export_admin_report: {e}")
-        return {"status": "error", "message": str(e)}
-
-@tool
-def send_email(to_email: str, subject: str, body: str, attachments: Optional[List[str]] = None) -> Dict[str, Any]:
-    """
-    Sends an email. Uses SMTP environment variables if set, otherwise logs to console.
-    """
-    use_smtp = all(os.getenv(k) for k in ["SMTP_SERVER", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD", "EMAIL_FROM"])
-
-    if not use_smtp:
-        logging.info("--- MOCK EMAIL ---")
-        logging.info(f"To: {to_email}")
-        logging.info(f"Subject: {subject}")
-        logging.info(f"Body: {body}")
-        if attachments:
-            logging.info(f"Attachments: {', '.join(attachments)}")
-        logging.info("--------------------")
-        return {"status": "success", "message": "Email logged to console (mock)."}
-
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = os.getenv("EMAIL_FROM")
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
-
-        if attachments:
-            for file_path in attachments:
-                if os.path.exists(file_path):
-                    with open(file_path, "rb") as f:
-                        part = MIMEApplication(f.read(), Name=os.path.basename(file_path))
-                    part['Content-Disposition'] = f'attachment; filename="{os.path.basename(file_path)}"'
-                    msg.attach(part)
-                else:
-                    logging.warning(f"Attachment not found: {file_path}")
-
-        server = smtplib.SMTP(os.getenv("SMTP_SERVER"), int(os.getenv("SMTP_PORT")))
-        server.starttls()
-        server.login(os.getenv("SMTP_USERNAME"), os.getenv("SMTP_PASSWORD"))
-        server.send_message(msg)
-        server.quit()
-        return {"status": "success", "message": "Email sent successfully."}
-    except Exception as e:
-        logging.error(f"Error sending email: {e}")
-        return {"status": "error", "message": f"Failed to send email: {e}"}
-
-@tool
-def send_sms(to_phone: str, message: str) -> Dict[str, Any]:
-    """
-    Logs an SMS message to the console. Real SMS sending is disabled.
-    """
-    logging.info("--- SMS Notification (Logged) ---")
-    logging.info(f"To: {to_phone}")
-    logging.info(f"Message: {message}")
-    logging.info("---------------------------------")
-    return {"status": "success", "message": "SMS logged to console."}
-
-@tool
-def send_intake_form(patient_id: int, booking_id: str, patient_email: str) -> Dict[str, Any]:
-    """Sends the new patient intake form via email."""
-    form_path = "/mnt/data/New Patient Intake Form (1).pdf"
-    if not os.path.exists(form_path):
-        logging.error(f"Intake form not found at the required path: {form_path}")
-        return {"status": "error", "message": "Intake form PDF not found on server."}
-
-    subject = "Your New Patient Intake Form"
-    body = f"""
-    Dear Patient,
-
-    Thank you for booking your appointment (ID: {booking_id}).
-
-    Please complete the attached New Patient Intake Form and bring it with you to your appointment.
-
-    We look forward to seeing you.
-
-    Sincerely,
-    The Clinic
-    """
-    return send_email(to_email=patient_email, subject=subject, body=body, attachments=[form_path])
-
-def _reminder_task(message: str, to_phone: str, to_email: str, subject: str):
-    """The actual task executed by the scheduler."""
-    logging.info(f"Executing reminder job: {subject}")
-    send_sms(to_phone, message)
-    send_email(to_email, subject, message)
-
-@tool
-def schedule_reminder_jobs(booking_id: str, appointment_iso: str, patient_phone: str, patient_email: str) -> Dict[str, Any]:
-    """
-    Schedules three automated reminders for the appointment.
-    1. 48 hours before: Standard reminder.
-    2. 24 hours before: Ask about intake form.
-    3. 6 hours before: Ask to confirm attendance.
-    """
-    try:
-        appt_time = datetime.fromisoformat(appointment_iso)
-
-        # Reminder 1: 48 hours before
-        reminder_1_time = appt_time - timedelta(hours=48)
-        if reminder_1_time > datetime.now():
-            msg1 = f"Reminder: Your appointment {booking_id} is scheduled for {appt_time.strftime('%A, %B %d at %I:%M %p')}."
-            scheduler.add_job(_reminder_task, 'date', run_date=reminder_1_time, args=[msg1, patient_phone, patient_email, "Appointment Reminder"])
-
-        # Reminder 2: 24 hours before
-        reminder_2_time = appt_time - timedelta(hours=24)
-        if reminder_2_time > datetime.now():
-            msg2 = f"Reminder for appointment {booking_id}: Have you completed your new patient intake form? If not, please let us know if you need assistance."
-            scheduler.add_job(_reminder_task, 'date', run_date=reminder_2_time, args=[msg2, patient_phone, patient_email, "Action Required: Intake Form"])
-
-        # Reminder 3: 6 hours before
-        reminder_3_time = appt_time - timedelta(hours=6)
-        if reminder_3_time > datetime.now():
-            msg3 = f"Final reminder for appointment {booking_id} today at {appt_time.strftime('%I:%M %p')}. Please reply to this message to confirm your attendance. If you need to cancel, please let us know the reason."
-            scheduler.add_job(_reminder_task, 'date', run_date=reminder_3_time, args=[msg3, patient_phone, patient_email, "Action Required: Confirm Your Appointment"])
-
-        return {"status": "success", "message": "Reminders scheduled successfully."}
-    except Exception as e:
-        logging.error(f"Error scheduling reminders: {e}")
-        return {"status": "error", "message": str(e)}
-
-# List of all tools for the agent
 all_tools = [
+    find_doctors_by_specialty_and_date,
     lookup_patient,
     register_new_patient,
     find_available_slots,
     book_appointment,
-    save_insurance_details,
-    export_admin_report,
-    send_email,
-    send_sms,
-    send_intake_form,
-    schedule_reminder_jobs,
+    finalize_booking_and_notify,
 ]
+

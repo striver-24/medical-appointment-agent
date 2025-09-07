@@ -1,7 +1,7 @@
 # Core AI Frameworks
 langchain==0.2.5
 langgraph==0.0.69
-langchain-groq==0.1.5
+langchain-google-genai==1.0.6
 langchain-core==0.2.10
 langchain-community==0.2.5
 
@@ -20,3 +20,5 @@ filelock==3.14.0
 
 # Testing
 pytest==8.2.2
+
+python-dateutil==2.9.0
